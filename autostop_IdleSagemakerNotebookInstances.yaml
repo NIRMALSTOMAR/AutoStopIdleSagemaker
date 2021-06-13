@@ -1,0 +1,174 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: 'AWS::Serverless-2016-10-31'
+Description: AWS Cloud Formation template to stop Idle Sagemaker Instances.
+Parameters:
+#general params 
+  
+  IdeleDurationInHours:
+    Description: Stop the instances which are idle from x hour. Provide the x value.
+    Type: String
+    Default: 1
+    
+  CommaSepratedExcludeInstancesList:
+    Description: Sagameake instance list in comma separated which you don't want to stop
+    Type: String
+    Default: instancename1,instancename2
+
+  ScheduleTime:
+    Type: String 
+    Description: Scheduler repeation time
+    Default: "rate(10 minutes)"
+
+
+  ScheduleTime:
+    Description: >
+      The rate (frequency) that determines when CloudWatch Events triggers the Lambda function.
+    Default: rate(30 minutes)
+    AllowedValues:
+      - rate(10 minutes)
+      - rate(30 minutes)
+      - rate(60 minutes)
+    Type: String    
+
+
+# Static variable Mapping
+Mappings: 
+    StaticValue: 
+      keyval: 
+        CreatedBy: "Nirmal Singh Tomar"
+        Feature: "This Lambda Function will execute in x mins and stop all Sagemaker instances which is inactive from some hour/time"
+
+
+Resources: 
+#lambda execution role config   
+  LambdaRoleToStopIdleSagemaker: 
+    Type: AWS::IAM::Role 
+    Properties: 
+      RoleName: !Sub "Lambda-role-to-stop-idle-sagemaker" 
+      Path: / 
+      AssumeRolePolicyDocument:               
+          Version: '2012-10-17' 
+          Statement: 
+          - Sid: 'LambdaSSMAssume' 
+            Effect: Allow 
+            Principal: 
+              Service: 
+              - lambda.amazonaws.com   
+            Action: sts:AssumeRole 
+  IamPolicyToStopIdleSagemakerInstance: 
+    Type: AWS::IAM::Policy 
+    DependsOn: [LambdaRoleToStopIdleSagemaker] 
+    Properties: 
+      PolicyName: Iam-policy-to-stop-idle-sagemaker-instance
+      PolicyDocument: 
+        Statement: 
+        - Action: ["logs:DescribeLogStreams", "logs:CreateLogStream", "logs:PutLogEvents", "logs:CreateLogGroup"] 
+          Resource: "*"  
+          Effect: Allow         
+        - Action: ["sagemaker:ListTags", "sagemaker:DescribeNotebookInstance", "sagemaker:StopNotebookInstance", "sagemaker:StartNotebookInstance", "sagemaker:ListNotebookInstances" ]
+          Resource: "*" 
+          Effect: Allow 
+      Roles: [!Ref LambdaRoleToStopIdleSagemaker]
+
+
+# Function: AutoStopIdleSageMakerInstance
+#This Lambda Function will execute in x mins and stop all Sagemaker instances which is inactive from some hour/time
+  AutoStopIdleSageMakerInstance:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: 'AutoStopIdleSageMakerInstance'
+      Handler: index.lambda_handler
+      Runtime: python3.8
+      Code:
+        ZipFile: | 
+          import boto3 
+          import os
+          import time               
+          
+          sagemakerClient = boto3.client('sagemaker')
+          logclient = boto3.client('logs') 
+          
+          idle_duration_in_hours = os.environ.get('idle_duration_in_hours')
+          comma_seprated_exclude_instancesList = os.environ.get('comma_seprated_exclude_instancesList')
+          
+          def lambda_handler(event, context):           
+              sagemakerinstancesList = sagemakerClient.list_notebook_instances() 
+              
+              excludedList = list(comma_seprated_exclude_instancesList.split(","))
+              print('excluded instances List:',excludedList) 
+              
+              #Fetch Current time in millis 
+              currentTime = int(round(time.time() * 1000)) 
+              print("currentTime >> " , currentTime) 
+              
+              for sagemakerinstance in sagemakerinstancesList['NotebookInstances']: 
+                  sagemakerinstanceName = sagemakerinstance['NotebookInstanceName'] 
+                  instanceArn = sagemakerinstance['NotebookInstanceArn'] 
+                  status = sagemakerinstance['NotebookInstanceStatus'] 
+                  lastModifiedTime =  sagemakerinstance['LastModifiedTime'] 
+                  print("Notebook Instance : " + sagemakerinstanceName +"  status : "+status) 
+
+                  #Create the logStream name 
+                  logStreamName = sagemakerinstanceName + '/jupyter.log' 
+
+                  if(sagemakerinstance['NotebookInstanceStatus'] == 'InService'): 
+                      logs = logclient.describe_log_streams(logGroupName='/aws/sagemaker/NotebookInstances',logStreamNamePrefix=logStreamName) 
+                      for logData in logs['logStreams']: 
+                          lastloggedTime = logData['lastIngestionTime'] 
+                          #print("lastloggedTime >> " , lastloggedTime) 
+                          print("lastloggedTime >> " , logData['lastIngestionTime'])    
+                          
+                          #Calculate the time difference between last log event time and current time in hours 
+                          timeDifference = (currentTime - lastloggedTime)/3600000 
+                          print("last log was entered before" , timeDifference) 
+                          
+                          #If the time difference is greater than or equal to the specified time in hours then Stop the notebook instance 
+                          
+                          if(timeDifference >= float(idle_duration_in_hours)): 
+                              if search(excludedList, sagemakerinstanceName):
+                                  print("Not stopping as NotebookInstanceName is vailable in Ignore list")
+                              else:
+                                  print("Stopping NotebookInstance:", sagemakerinstanceName)
+                                  response = sagemakerClient.stop_notebook_instance(NotebookInstanceName=sagemakerinstanceName)
+                  print("**********************************");                  
+              print("End Program");
+
+              
+          def search(excludeList, instanceName):
+              for i in range(len(excludeList)):
+                  if excludeList[i] == instanceName:
+                      return True
+              return False              
+
+      Description: ''
+      MemorySize: 128
+      Timeout: 120
+      Role: !GetAtt LambdaRoleToStopIdleSagemaker.Arn
+      Environment: 
+        Variables: 
+          idle_duration_in_hours: !Ref IdeleDurationInHours
+          comma_seprated_exclude_instancesList: !Ref CommaSepratedExcludeInstancesList
+      Tags: 
+        - Key: "CreatedBy"
+          Value: !FindInMap [StaticValue, keyval, CreatedBy]
+        - Key: "Feature"
+          Value: !FindInMap [StaticValue, keyval, Feature]
+
+
+  AutoStopIdleSageMakerInstanceScheduler:
+    Type: "AWS::Events::Rule"
+    Properties:
+      Description: Auto Stop Idle SageMaker Instance Scheduler
+      ScheduleExpression: !Ref ScheduleTime
+      State: ENABLED
+      Targets:
+        - Arn: !Sub ${AutoStopIdleSageMakerInstance.Arn}
+          Id: AutoStopIdleSageMakerInstanceScheduler
+
+  PermissionForEventsToInvokeLambda:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Sub ${AutoStopIdleSageMakerInstance.Arn}
+      Principal: 'events.amazonaws.com'
+      SourceArn: !Sub ${AutoStopIdleSageMakerInstanceScheduler.Arn}
